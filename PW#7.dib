@@ -17,9 +17,165 @@
 
 #!csharp
 
+// Необходимые классы
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
+
+#!csharp
+
+// Интерфейс ICommand для выполнения команд
 public interface ICommand
 {
     void Execute();
+}
+
+#!csharp
+
+// Класс ServerThread для управления потоком и обработки команд
+public class ServerThread
+{
+    private Thread thread;
+    private ConcurrentQueue<ICommand> commandQueue;
+    private volatile bool isRunning;
+    private volatile bool softStopRequested;
+
+    public ServerThread()
+    {
+        commandQueue = new ConcurrentQueue<ICommand>();
+        thread = new Thread(Run) { IsBackground = true };
+        isRunning = true;
+    }
+
+    public void Start() { thread.Start(); }
+
+    public void Stop() { isRunning = false; thread.Join(); }
+
+    public void EnqueueCommand(ICommand command)
+    {
+        if (isRunning) { commandQueue.Enqueue(command); }
+    }
+
+    private void Run()
+    {
+        while (isRunning)
+        {
+            if (commandQueue.TryDequeue(out ICommand command))
+            {
+                try { command.Execute(); }
+                catch (Exception ex) { Console.WriteLine($"Исключение: {ex.Message}"); }
+            }
+
+            if (softStopRequested && commandQueue.IsEmpty) { isRunning = false; }
+        }
+    }
+
+    public void RequestSoftStop() { softStopRequested = true; }
+
+    public void HardStop() { isRunning = false; }
+
+    public bool IsRunning => isRunning;
+
+    public Thread GetThread() => thread;
+}
+
+#!csharp
+
+// Команда HardStop для немедленной остановки потока
+public class HardStopCommand : ICommand
+{
+    private readonly ServerThread serverThread;
+
+    public HardStopCommand(ServerThread serverThread)
+    {
+        this.serverThread = serverThread;
+    }
+
+    public void Execute()
+    {
+        if (Thread.CurrentThread == serverThread.GetThread())
+        {
+            serverThread.HardStop();
+        }
+        else
+        {
+            throw new InvalidOperationException("HardStopCommand может выполняться только в потоке сервера.");
+        }
+    }
+}
+
+// Команда SoftStop для мягкой остановки потока
+public class SoftStopCommand : ICommand
+{
+    private readonly ServerThread serverThread;
+
+    public SoftStopCommand(ServerThread serverThread)
+    {
+        this.serverThread = serverThread;
+    }
+
+    public void Execute()
+    {
+        if (Thread.CurrentThread == serverThread.GetThread())
+        {
+            serverThread.RequestSoftStop();
+        }
+        else
+        {
+            throw new InvalidOperationException("SoftStopCommand может выполняться только в потоке сервера.");
+        }
+    }
+}
+
+#!csharp
+
+// Проверка работы
+
+var serverThread = new ServerThread();
+serverThread.Start();
+
+serverThread.EnqueueCommand(new SoftStopCommand(serverThread));
+serverThread.EnqueueCommand(new HardStopCommand(serverThread));
+
+serverThread.Stop();
+
+// Проверка состояния потока после выполнения команд
+Console.WriteLine($"Выполняется ли серверный поток: {serverThread.IsRunning}"); // Ожидается false
+
+// Дополнительные проверки для гарантии правильного выполнения команд
+try
+{
+    var otherThread = new Thread(() =>
+    {
+        var hardStopCommand = new HardStopCommand(serverThread);
+        var softStopCommand = new SoftStopCommand(serverThread);
+
+        // Попытка выполнения команд в другом потоке должна вызывать исключения
+        try
+        {
+            hardStopCommand.Execute();
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.WriteLine($"Поймано ожидаемое исключение: {ex.Message}");
+        }
+
+        try
+        {
+            softStopCommand.Execute();
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.WriteLine($"Поймано ожидаемое исключение: {ex.Message}");
+        }
+    });
+
+    otherThread.Start();
+    otherThread.Join();
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Непредвиденное исключение: {ex.Message}");
 }
 
 #!markdown
