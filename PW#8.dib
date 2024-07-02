@@ -1,0 +1,212 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"languageName":"csharp","name":"csharp"}]}}
+
+#!markdown
+
+# Практическая работа №8. Реализация планировщика команд.
+
+**Цель:** Реализация длительных операций.
+
+**Результаты:** После выполнения работы Вы сможете:
+1. Сделать возможным в потоке выполнять длительные операции.
+
+## Задание.
+Пусть, в условиях практической работы №7, у нас есть поток с очередью, который в цикле извлекает команды из очереди и выполняет их.
+
+Некоторые из команд не могут выполнить всю работу за один вызов метода Execute без блокирования на длительное время выполнения всех остальных командд из очереди.
+
+Например, если какая-нибудь сетевая игра представлена командой, то пока одна игра не закончится, следующая не начнется. Чтобы эффективнее использовать процессорные
+можности, нужно обеспечить возхможность поиграть как можно большему количеству игроков.
+
+Для этого используют режим псевдопараллельной обработки. Когда все время работы разбивают на небольшие отрезки, каждый из которых выполняется
+за один вызов метода Execute. Чтобы выполнить всю работу, нужно вызвать метод Execute несколько раз, до тех пор пока работа не будет завершена.
+Это позволяет между вызовами Execute одного экземплыра команды вызывать метод Execute других команд.
+
+Так устроен, например, ренедринг страницы в браузере. Только в браузеоре это используется не для рендеренга всех вкладок, а для обработки 
+реакций пользователя на странице.
+
+В прошлой работе все команды, которые выполнялись в потоке, брались из очереди. Поэтому первая идея - это положить долгоиграющую операцию обратно в очередь.
+Но это может привести к состоянию мертвой блокировки потока: если очередь будет полна, то поток, который попытается сделать запись, будет заблокирован до тех пор, 
+пока в очереди не появится свободное место. Поэтому нельзя в одном и том же потоке читать и писать в очередь неблокируемым образом.
+
+Чтобы избежать мертвой блокировки потока, необходимо ввести понятие Планировщика, который будет отвечать за выбор следующей длительной задачи для выполнения,
+а чтение из очереди оставить только для новых операций. 
+
+#!csharp
+
+// Необходимые классы
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
+
+#!csharp
+
+// Интерфейс ICommand для выполнения команд
+public interface ICommand
+{
+    void Execute();
+}
+
+// Интерфейс планировщика
+public interface IScheduler
+{
+    bool HasCommand();
+    ICommand Select();
+    void Add(ICommand cmd);
+}
+
+#!csharp
+
+// Планировщик Round-Robin
+public class RoundRobinScheduler : IScheduler
+{
+    private readonly Queue<ICommand> scheduledCommands = new Queue<ICommand>();
+
+    public bool HasCommand() => scheduledCommands.Count > 0;
+
+    public ICommand Select()
+    {
+        if (scheduledCommands.Count == 0) throw new InvalidOperationException("Нет доступных комманд.");
+
+        var cmd = scheduledCommands.Dequeue();
+        scheduledCommands.Enqueue(cmd);
+        return cmd;
+    }
+
+    public void Add(ICommand cmd) => scheduledCommands.Enqueue(cmd);
+}
+
+#!csharp
+
+// Класс ServerThread для управления потоком и обработки команд
+public class ServerThread
+{
+    private Thread thread;
+    private ConcurrentQueue<ICommand> commandQueue;
+    private volatile bool isRunning;
+    private volatile bool softStopRequested;
+    private IScheduler scheduler;
+
+    public ServerThread(IScheduler scheduler)
+    {
+        commandQueue = new ConcurrentQueue<ICommand>();
+        this.scheduler = scheduler;
+        thread = new Thread(Run) { IsBackground = true };
+        isRunning = true;
+    }
+
+    public void Start() { thread.Start(); }
+
+    public void Stop() { isRunning = false; thread.Join(); }
+
+    public void EnqueueCommand(ICommand command)
+    {
+        if (isRunning) { commandQueue.Enqueue(command); }
+    }
+
+    private void Run()
+    {
+        while (isRunning)
+        {
+            // Добавление новых команд в планировщик
+            if (commandQueue.TryDequeue(out ICommand command))
+            {
+                scheduler.Add(command);
+            }
+
+            // Выполнение команд из планировщика в режиме Round Robin
+            if (scheduler.HasCommand())
+            {
+                try
+                {
+                    var nextCommand = scheduler.Select();
+                    nextCommand.Execute();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Исключение: {ex.Message}");
+                }
+            }
+            else
+            {
+                Thread.Sleep(10); // предотвращает пустую трату процессорного времени
+            }
+
+            if (softStopRequested && commandQueue.IsEmpty && !scheduler.HasCommand())
+            {
+                isRunning = false;
+            }
+        }
+    }
+
+    public void RequestSoftStop() { softStopRequested = true; }
+
+    public void HardStop() { isRunning = false; }
+
+    public bool IsRunning => isRunning;
+
+    public Thread GetThread() => thread;
+}
+
+#!csharp
+
+// Команда HardStop для немедленной остановки потока
+public class HardStopCommand : ICommand
+{
+    private readonly ServerThread serverThread;
+
+    public HardStopCommand(ServerThread serverThread)
+    {
+        this.serverThread = serverThread;
+    }
+
+    public void Execute()
+    {
+        if (Thread.CurrentThread == serverThread.GetThread())
+        {
+            serverThread.HardStop();
+        }
+        else
+        {
+            throw new InvalidOperationException("HardStopCommand может выполняться только в потоке сервера.");
+        }
+    }
+}
+
+// Команда SoftStop для мягкой остановки потока
+public class SoftStopCommand : ICommand
+{
+    private readonly ServerThread serverThread;
+
+    public SoftStopCommand(ServerThread serverThread)
+    {
+        this.serverThread = serverThread;
+    }
+
+    public void Execute()
+    {
+        if (Thread.CurrentThread == serverThread.GetThread())
+        {
+            serverThread.RequestSoftStop();
+        }
+        else
+        {
+            throw new InvalidOperationException("SoftStopCommand может выполняться только в потоке сервера.");
+        }
+    }
+}
+
+#!markdown
+
+Необходимо реализовать поток, который способен реализоввывать длительные операции.
+
+**Указание.** 
+1. В практической работе №7 из очереди команды извлекались блокируеммым образом с помощью метода Take(), при наличии планировщика так делать нельзя: поток
+может заснуть несмотря на наличие команд в планировщике до тех пор, пока не будет записана новая команда в очередь.
+
+С другой стороны, если будем всегда читать неблокируемым образом, а в планировщике нет никакой работы, то будем тратить процессорное время без полезной нагрузки.
+
+Необходимо учесть этот момент при реализации очереди.
+
+2. Для обепечения справедливости стратегии планировщика в слабом смысле использовать стратегию Round Robbin (циклическую) для определения следующего потока на исполнение.
